@@ -1,0 +1,142 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+from typing import Optional, Union
+
+
+class Avatar(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.help = 1
+
+    async def resolve_user(self, ctx, user_input):
+        """Resolve a user from mention, ID, or object"""
+        if user_input is None:
+            return ctx.author
+
+        # Already a discord object
+        if isinstance(user_input, (discord.User, discord.Member)):
+            return user_input
+
+        # Try ID
+        try:
+            user_id = int(user_input)
+            return await self.bot.fetch_user(user_id)
+        except:
+            pass
+
+        # Try member lookup (fallback)
+        if ctx.guild:
+            member = discord.utils.find(
+                lambda m: m.name == user_input or m.display_name == user_input,
+                ctx.guild.members
+            )
+            if member:
+                return member
+
+        return None
+
+    # ---------------- PREFIX COMMANDS ---------------- #
+
+    @commands.command(name="avatar", aliases=["av"])
+    async def avatar(self, ctx: commands.Context, user: Optional[Union[discord.Member, discord.User, str]] = None):
+        """Show a user's avatar"""
+        target = await self.resolve_user(ctx, user)
+
+        if not target:
+            await ctx.send("❌ User not found")
+            return
+
+        name = target.display_name if isinstance(target, discord.Member) else target.name
+
+        embed = discord.Embed(
+            title=f"{name}'s Avatar",
+            color=0x6A0DAD
+        )
+        embed.set_image(url=target.display_avatar.url)
+        embed.add_field(name="URL", value=f"[Click here]({target.display_avatar.url})", inline=False)
+
+        await ctx.send(embed=embed)
+
+    @commands.command(name="banner")
+    async def banner(self, ctx: commands.Context, user: Optional[Union[discord.Member, discord.User, str]] = None):
+        """Show a user's banner"""
+        target = await self.resolve_user(ctx, user)
+
+        if not target:
+            await ctx.send("❌ User not found")
+            return
+
+        try:
+            user_data = await self.bot.fetch_user(target.id)
+            banner = user_data.banner
+        except:
+            banner = None
+
+        if not banner:
+            await ctx.send(f"❌ <@{target.id}> has no banner set")
+            return
+
+        name = target.display_name if isinstance(target, discord.Member) else target.name
+
+        embed = discord.Embed(
+            title=f"{name}'s Banner",
+            color=0x6A0DAD
+        )
+        embed.set_image(url=banner.url)
+        embed.add_field(name="URL", value=f"[Click here]({banner.url})", inline=False)
+
+        await ctx.send(embed=embed)
+
+    # ---------------- SLASH COMMANDS ---------------- #
+
+    @app_commands.command(name="avatar", description="Show a user's avatar")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    @app_commands.describe(user="User to show avatar for (optional)")
+    async def slash_avatar(self, interaction: discord.Interaction, user: discord.User = None):
+        """Show a user's avatar"""
+        target = user or interaction.user
+
+        embed = discord.Embed(
+            title=f"{target.name}'s Avatar",
+            color=0x6A0DAD
+        )
+        embed.set_image(url=target.display_avatar.url)
+        embed.add_field(name="URL", value=f"[Click here]({target.display_avatar.url})", inline=False)
+
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="banner", description="Show a user's banner")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    @app_commands.describe(user="User to show banner for (optional)")
+    async def slash_banner(self, interaction: discord.Interaction, user: discord.User = None):
+        """Show a user's banner"""
+        target = user or interaction.user
+
+        try:
+            user_data = await self.bot.fetch_user(target.id)
+            banner = user_data.banner
+        except:
+            banner = None
+
+        if not banner:
+            await interaction.response.send_message(
+                f"❌ <@{target.id}> has no banner set",
+                ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(
+            title=f"{target.name}'s Banner",
+            color=0x6A0DAD
+        )
+        embed.set_image(url=banner.url)
+        embed.add_field(name="URL", value=f"[Click here]({banner.url})", inline=False)
+
+        await interaction.response.send_message(embed=embed)
+
+
+async def setup(bot):
+    await bot.add_cog(Avatar(bot))
