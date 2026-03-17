@@ -1,0 +1,554 @@
+from __future__ import annotations
+
+import json
+import traceback
+import typing as t
+from pathlib import Path
+import asyncio
+from collections import defaultdict
+from datetime import datetime
+import zlib
+
+import discord
+from discord.ext import commands
+from discord.ui.select import Select
+
+
+# =========================================================
+# Helper function for component IDs
+# =========================================================
+
+def _string_to_field_id(name: str) -> int:
+    return zlib.crc32(name.encode()) & 0x7FFFFFFF
+
+
+# =========================================================
+# Field IDs for dynamic components
+# =========================================================
+
+CURRENT_PREFIXES_ID = _string_to_field_id("current_prefixes")
+STATUS_MESSAGE_ID = _string_to_field_id("status_message")
+
+
+# =========================================================
+# Paths (Linux Safe)
+# =========================================================
+
+DATA_DIR = Path("data")
+PREFIX_FILE = DATA_DIR / "prefixes.json"
+CONFLICT_FILE = DATA_DIR / "prefix_conflicts.json"
+
+
+def ensure_files() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not PREFIX_FILE.exists():
+        PREFIX_FILE.write_text(json.dumps({"global": [","]}, indent=4))
+
+    if not CONFLICT_FILE.exists():
+        CONFLICT_FILE.write_text(json.dumps({}, indent=4))
+
+
+def load_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_json(path: Path, data: dict) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+
+
+# =========================================================
+# Base Layout View (from rules)
+# =========================================================
+
+class BaseLayoutView(discord.ui.LayoutView):
+    interaction: discord.Interaction | None = None
+    message: discord.Message | None = None
+
+    def __init__(self, user: discord.User | discord.Member, timeout: float = 60.0):
+        super().__init__(timeout=timeout)
+        self.user = user
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message(
+                "You cannot interact with this view.",
+                ephemeral=True,
+            )
+            return False
+        self.interaction = interaction
+        return True
+
+    def _disable_all(self) -> None:
+        for item in self.walk_children():
+            if isinstance(item, (discord.ui.Button, Select)):
+                item.disabled = True
+
+    async def _edit(self, *args: t.Any, **kwargs: t.Any) -> None:
+        if self.interaction is None and self.message is not None:
+            await self.message.edit(*args, **kwargs)
+        elif self.interaction is not None:
+            try:
+                await self.interaction.response.edit_message(*args, **kwargs)
+            except discord.InteractionResponded:
+                self.message = await self.interaction.original_response()
+                await self.message.edit(*args, **kwargs)
+
+    async def on_timeout(self) -> None:
+        self._disable_all()
+        await self._edit(view=self)
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        self._disable_all()
+        self.add_item(discord.ui.TextDisplay(f"Error:\n```py\n{tb}\n```"))
+        await self._edit(view=self)
+        self.stop()
+
+
+# =========================================================
+# Prefix Action Row (for set/clear buttons)
+# =========================================================
+
+class PrefixActionRow(discord.ui.ActionRow["PrefixSetView"]):
+    view: "PrefixSetView"
+
+    @discord.ui.button(label="Set", style=discord.ButtonStyle.primary)
+    async def set_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        """Open modal to set a new prefix."""
+        modal = PrefixModal(self.view.bot, self.view.guild_id)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Clear", style=discord.ButtonStyle.secondary)
+    async def clear_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        """Clear custom guild prefix."""
+        prefixes = load_json(PREFIX_FILE)
+        guild_id = str(self.view.guild_id)
+        
+        if guild_id in prefixes:
+            del prefixes[guild_id]
+            save_json(PREFIX_FILE, prefixes)
+            
+            # Update display
+            current = self.view.find_item(CURRENT_PREFIXES_ID)
+            if isinstance(current, discord.ui.TextDisplay):
+                global_prefixes = prefixes.get("global", [","])
+                current.content = (
+                    "## Current Prefixes\n"
+                    f"**Global:** `{global_prefixes[0]}`\n"
+                    "**Guild:** None (using global)"
+                )
+            
+            # Update status
+            status = self.view.find_item(STATUS_MESSAGE_ID)
+            if isinstance(status, discord.ui.TextDisplay):
+                status.content = (
+                    f"**Status:** Success\n"
+                    f"**Action:** Cleared custom prefix\n"
+                    f"**Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+                )
+            
+            await self.view._edit(view=self.view)
+            await interaction.response.send_message("Prefix cleared.", ephemeral=True)
+        else:
+            await interaction.response.send_message("No custom prefix to clear.", ephemeral=True)
+
+
+# =========================================================
+# Prefix Modal
+# =========================================================
+
+class PrefixModal(discord.ui.Modal, title="Set Custom Prefix"):
+    def __init__(self, bot: commands.Bot, guild_id: int) -> None:
+        super().__init__()
+        self.bot = bot
+        self.guild_id = guild_id
+
+    prefix_input = discord.ui.TextInput(
+        label="New Prefix",
+        placeholder="Enter a new prefix (e.g., !, ?, -)",
+        min_length=1,
+        max_length=3,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        new_prefix = self.prefix_input.value.strip()
+        
+        prefixes = load_json(PREFIX_FILE)
+        guild_id = str(self.guild_id)
+        
+        prefixes[guild_id] = [new_prefix]
+        save_json(PREFIX_FILE, prefixes)
+        
+        await interaction.response.send_message(
+            f"Prefix set to `{new_prefix}`",
+            ephemeral=True,
+        )
+
+
+# =========================================================
+# Prefix Set View - Following STRUCTURE TEMPLATE
+# =========================================================
+
+class PrefixSetView(BaseLayoutView):
+    def __init__(
+        self,
+        user: discord.User | discord.Member,
+        bot: commands.Bot,
+        guild_id: int,
+        current_prefixes: list[str],
+        timeout: float = 60,
+    ):
+        super().__init__(user, timeout)
+        self.bot = bot
+        self.guild_id = guild_id
+
+        # Build prefix display
+        if len(current_prefixes) == 1:
+            prefix_text = f"**Guild:** `{current_prefixes[0]}`"
+        else:
+            prefix_text = "**Guild:** None (using global)"
+
+        global_prefixes = load_json(PREFIX_FILE).get("global", [","])
+
+        # Section 1: Title with thumbnail (bot's avatar)
+        title_section = discord.ui.Section["PrefixSetView"](
+            "## Prefix Configuration",
+            "Set or clear custom server prefix.",
+            accessory=discord.ui.Thumbnail["PrefixSetView"](bot.user.display_avatar.url),
+        )
+
+        # Separator 1: Large visible separator after title
+        separator1 = discord.ui.Separator["PrefixSetView"](
+            visible=True,
+            spacing=discord.SeparatorSpacing.large,
+        )
+
+        # TextDisplay 1: Current prefixes
+        current_display = discord.ui.TextDisplay["PrefixSetView"](
+            content=(
+                "## Current Prefixes\n"
+                f"**Global:** `{global_prefixes[0]}`\n"
+                f"{prefix_text}"
+            ),
+            id=CURRENT_PREFIXES_ID,
+        )
+
+        # Separator 2: Large visible separator before buttons
+        separator2 = discord.ui.Separator["PrefixSetView"](
+            visible=True,
+            spacing=discord.SeparatorSpacing.large,
+        )
+
+        # ActionRow: Set/Clear buttons
+        action_row = PrefixActionRow()
+
+        # Separator 3: Small visible separator before status
+        separator3 = discord.ui.Separator["PrefixSetView"](
+            visible=True,
+            spacing=discord.SeparatorSpacing.small,
+        )
+
+        # TextDisplay 2: Status/Timestamp
+        status_display = discord.ui.TextDisplay["PrefixSetView"](
+            content=(
+                f"**Status:** Ready\n"
+                f"**Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+            ),
+            id=STATUS_MESSAGE_ID,
+        )
+
+        # Container: Root container with dark grey accent
+        container = discord.ui.Container["PrefixSetView"](
+            title_section,
+            separator1,
+            current_display,
+            separator2,
+            action_row,
+            separator3,
+            status_display,
+            accent_color=discord.Color.dark_grey(),
+        )
+
+        self.add_item(container)
+
+
+# =========================================================
+# Prefix Info View - Following STRUCTURE TEMPLATE
+# =========================================================
+
+class PrefixInfoView(BaseLayoutView):
+    def __init__(
+        self,
+        user: discord.User | discord.Member,
+        bot: commands.Bot,
+        guild_id: int,
+        timeout: float = 60,
+    ):
+        super().__init__(user, timeout)
+
+        prefixes = load_json(PREFIX_FILE)
+        conflicts = load_json(CONFLICT_FILE)
+
+        global_prefixes = prefixes.get("global", [","])
+        guild_prefixes = prefixes.get(str(guild_id), [])
+        guild_conflicts = conflicts.get(str(guild_id), {})
+
+        mention_prefix = f"<@{bot.user.id}>"
+
+        # Build global prefixes block
+        global_block = "\n".join(
+            f"{i+1}. `{p}`" for i, p in enumerate(global_prefixes)
+        )
+
+        # Build guild prefix block
+        if guild_prefixes:
+            guild_block = f"**Server:** `{guild_prefixes[0]}`"
+        else:
+            guild_block = "**Server:** None (using global)"
+
+        # Build conflict block
+        conflict_lines = []
+        if guild_conflicts:
+            for prefix, bots in guild_conflicts.items():
+                conflict_lines.append(f"### `{prefix}`")
+                for bot_info in bots:
+                    conflict_lines.append(f"- {bot_info}")
+        else:
+            conflict_lines = ["None detected."]
+
+        # Section 1: Title with thumbnail (bot's avatar)
+        title_section = discord.ui.Section["PrefixInfoView"](
+            "## Prefix Information",
+            "Current prefix configuration and detected conflicts.",
+            accessory=discord.ui.Thumbnail["PrefixInfoView"](bot.user.display_avatar.url),
+        )
+
+        # Separator 1: Large visible separator after title
+        separator1 = discord.ui.Separator["PrefixInfoView"](
+            visible=True,
+            spacing=discord.SeparatorSpacing.large,
+        )
+
+        # TextDisplay 1: Prefixes
+        prefixes_display = discord.ui.TextDisplay["PrefixInfoView"](
+            content=(
+                "## Prefixes\n"
+                f"{global_block}\n"
+                f"{len(global_prefixes)+1}. `{mention_prefix}`\n\n"
+                f"{guild_block}"
+            )
+        )
+
+        # Separator 2: Large visible separator before conflicts
+        separator2 = discord.ui.Separator["PrefixInfoView"](
+            visible=True,
+            spacing=discord.SeparatorSpacing.large,
+        )
+
+        # TextDisplay 2: Conflicts
+        conflict_display = discord.ui.TextDisplay["PrefixInfoView"](
+            content=(
+                "## Conflicting Prefixes\n"
+                f"{chr(10).join(conflict_lines)}"
+            )
+        )
+
+        # Separator 3: Small visible separator before footer
+        separator3 = discord.ui.Separator["PrefixInfoView"](
+            visible=True,
+            spacing=discord.SeparatorSpacing.small,
+        )
+
+        # TextDisplay 3: Footer/Timestamp
+        last_updated = None
+        if CONFLICT_FILE.exists():
+            mtime = CONFLICT_FILE.stat().st_mtime
+            last_updated = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+        
+        footer_lines = ["-# Conflicts detected automatically"]
+        if last_updated:
+            footer_lines.append(f"-# Updated: {last_updated}")
+        
+        footer = discord.ui.TextDisplay["PrefixInfoView"](
+            content="\n".join(footer_lines)
+        )
+
+        # Container: Root container with dark grey accent
+        container = discord.ui.Container["PrefixInfoView"](
+            title_section,
+            separator1,
+            prefixes_display,
+            separator2,
+            conflict_display,
+            separator3,
+            footer,
+            accent_color=discord.Color.dark_grey(),
+        )
+
+        self.add_item(container)
+
+
+# =========================================================
+# Cog with Subcommands
+# =========================================================
+
+class PrefixCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self._recent_detections = defaultdict(float)
+        ensure_files()
+
+    @commands.Cog.listener()
+    async def on_command_completion(self, ctx: commands.Context):
+        """Automatically detect conflicts when a command is successfully invoked."""
+        if not ctx.guild:
+            return
+
+        prefix = ctx.prefix.strip()
+        
+        if prefix.startswith("<@"):
+            return
+
+        now = asyncio.get_event_loop().time()
+        if now - self._recent_detections[ctx.guild.id] < 60:
+            return
+        self._recent_detections[ctx.guild.id] = now
+
+        await asyncio.sleep(1.5)
+
+        conflicts = defaultdict(list)
+        
+        try:
+            async for msg in ctx.channel.history(limit=20, after=ctx.message):
+                if msg.created_at < ctx.message.created_at:
+                    continue
+                
+                if msg.author.id == self.bot.user.id:
+                    continue
+                
+                if msg.author.bot:
+                    bot_name = msg.author.display_name or msg.author.name
+                    bot_id = msg.author.id
+                    
+                    content = msg.content.lower()
+                    detected_prefix = prefix
+                    
+                    common_prefixes = ["!", ".", "-", "?", "$", "%", "^", "&", "*", "=", "+"]
+                    for p in common_prefixes:
+                        if content.startswith(p) or f" {p}" in content:
+                            detected_prefix = p
+                            break
+                    
+                    conflicts[detected_prefix].append(f"{bot_name} (`{bot_id}`)")
+
+                if len(conflicts) >= 3:
+                    break
+        except Exception:
+            pass
+
+        if conflicts:
+            conflict_data = load_json(CONFLICT_FILE)
+            guild_conflicts = conflict_data.get(str(ctx.guild.id), {})
+            
+            updated = False
+            for p, bots in conflicts.items():
+                existing = set(guild_conflicts.get(p, []))
+                new_bots = set(bots)
+                
+                if new_bots - existing:
+                    existing.update(new_bots)
+                    guild_conflicts[p] = list(existing)
+                    updated = True
+            
+            if updated:
+                conflict_data[str(ctx.guild.id)] = guild_conflicts
+                save_json(CONFLICT_FILE, conflict_data)
+
+    @commands.group(name="prefix", invoke_without_command=True)
+    async def prefix(self, ctx: commands.Context):
+        """Show prefix information and detected conflicts."""
+        if not ctx.guild:
+            return
+
+        view = PrefixInfoView(
+            ctx.author,
+            self.bot,
+            ctx.guild.id,
+        )
+
+        view.message = await ctx.send(view=view)
+
+    @prefix.command(name="set")
+    @commands.has_permissions(administrator=True)
+    async def prefix_set(self, ctx: commands.Context, *, prefix: str):
+        """
+        Set a custom prefix for this server.
+        
+        Example: ,prefix set !
+        Administrators only.
+        """
+        if not ctx.guild:
+            return
+
+        if len(prefix) > 3:
+            await ctx.send("Prefix must be 3 characters or less.")
+            return
+
+        prefixes = load_json(PREFIX_FILE)
+        guild_id = str(ctx.guild.id)
+        
+        prefixes[guild_id] = [prefix]
+        save_json(PREFIX_FILE, prefixes)
+        
+        # Show confirmation
+        view = PrefixSetView(
+            ctx.author,
+            self.bot,
+            ctx.guild.id,
+            [prefix],
+        )
+        view.message = await ctx.send(
+            f"Prefix set to `{prefix}`",
+            view=view,
+        )
+
+    @prefix.command(name="clear")
+    @commands.has_permissions(administrator=True)
+    async def prefix_clear(self, ctx: commands.Context):
+        """
+        Clear custom prefix and revert to global.
+        
+        Example: ,prefix clear
+        Administrators only.
+        """
+        if not ctx.guild:
+            return
+
+        prefixes = load_json(PREFIX_FILE)
+        guild_id = str(ctx.guild.id)
+        
+        if guild_id in prefixes:
+            del prefixes[guild_id]
+            save_json(PREFIX_FILE, prefixes)
+            await ctx.send("Custom prefix cleared. Using global prefix now.")
+        else:
+            await ctx.send("No custom prefix set for this server.")
+
+
+# =========================================================
+# Extension Setup
+# =========================================================
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(PrefixCog(bot))
