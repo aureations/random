@@ -488,7 +488,7 @@ class PrefixCog(commands.Cog):
         )
 
         view.message = await ctx.send(view=view)
-
+    
     @prefix.command(name="set")
     @commands.has_permissions(administrator=True)
     async def prefix_set(self, ctx: commands.Context, *, prefix: str):
@@ -500,18 +500,18 @@ class PrefixCog(commands.Cog):
         """
         if not ctx.guild:
             return
-
+    
         if len(prefix) > 3:
             await ctx.send("Prefix must be 3 characters or less.")
             return
-
+    
         prefixes = load_json(PREFIX_FILE)
         guild_id = str(ctx.guild.id)
         
         prefixes[guild_id] = [prefix]
         save_json(PREFIX_FILE, prefixes)
         
-        # Show confirmation
+        # Show confirmation with the prefix
         view = PrefixSetView(
             ctx.author,
             self.bot,
@@ -519,7 +519,7 @@ class PrefixCog(commands.Cog):
             [prefix],
         )
         view.message = await ctx.send(
-            f"Prefix set to `{prefix}`",
+            f"**prefix set:** `{prefix}`",
             view=view,
         )
 
