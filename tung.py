@@ -7,6 +7,7 @@ import zlib
 from collections import defaultdict
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 __all__: tuple[str, ...] = ("AutoResponder", "BaseLayoutView")
@@ -155,6 +156,8 @@ class AutoResponderView(BaseLayoutView):
             components.extend(self._build_list_content())
         elif self.mode == "confirm_delete":
             components.extend(self._build_confirm_delete_content())
+        elif self.mode == "delete_complete":
+            components.extend(self._build_delete_complete_content())
         
         # Add separator and footer
         components.append(discord.ui.Separator["AutoResponderView"](visible=True, spacing=discord.SeparatorSpacing.large))
@@ -212,13 +215,22 @@ class AutoResponderView(BaseLayoutView):
             AutoResponderConfirmRow(),
         ]
 
+    def _build_delete_complete_content(self) -> list[discord.ui.Item]:
+        """Build content for delete completion"""
+        return [
+            discord.ui.TextDisplay["AutoResponderView"](
+                f"### Trigger Deleted\nTrigger **{self.trigger}** has been removed.",
+                id=self.TRIGGER_DISPLAY_ID,
+            ),
+        ]
+
     def _build_list_content(self) -> list[discord.ui.Item]:
         """Build content for list mode"""
         start = self.page * 5
         end = start + 5
         page_triggers = self.triggers[start:end]
         
-        if not page_triggers:
+        if not self.triggers:
             content = "No autoresponders configured for this server."
         else:
             lines = []
@@ -229,8 +241,7 @@ class AutoResponderView(BaseLayoutView):
                 lines.append(f"**Response:** {response[:50]}{'...' if len(response) > 50 else ''}")
                 lines.append(f"**Added by:** {author_name}")
                 lines.append("")  # Empty line between entries
-        
-        content = "### AutoResponder List\n\n" + "\n".join(lines) if lines else "No triggers found."
+            content = "### AutoResponder List\n\n" + "\n".join(lines)
         
         components = [
             discord.ui.TextDisplay["AutoResponderView"](
@@ -281,31 +292,17 @@ class AutoResponderView(BaseLayoutView):
 
     async def execute_delete(self, interaction: discord.Interaction) -> None:
         """Execute the delete after confirmation"""
+        # Get the cog instance to modify the triggers dict
+        cog = self.bot.get_cog("AutoResponder")
+        if cog and self.guild_id in cog.triggers and self.trigger and self.trigger.lower() in cog.triggers[self.guild_id]:
+            del cog.triggers[self.guild_id][self.trigger.lower()]
+        
         self.mode = "delete_complete"
         self._disable_all()
         
         # Rebuild container for completion message
         self.clear_items()
-        components = [
-            discord.ui.Section["AutoResponderView"](
-                "## AutoResponder",
-                accessory=discord.ui.Thumbnail["AutoResponderView"](self.bot.user.display_avatar.url),
-            ),
-            discord.ui.TextDisplay["AutoResponderView"](
-                f"### Trigger Deleted\nTrigger **{self.trigger}** has been removed.",
-                id=self.TRIGGER_DISPLAY_ID,
-            ),
-            discord.ui.Separator["AutoResponderView"](visible=True, spacing=discord.SeparatorSpacing.large),
-            discord.ui.TextDisplay["AutoResponderView"](
-                f"-# Requested by {self.user.display_name} • {discord.utils.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
-            ),
-        ]
-        
-        container = discord.ui.Container["AutoResponderView"](
-            *components,
-            accent_color=discord.Color.dark_grey(),
-        )
-        self.add_item(container)
+        self._build_container()
         
         await self._edit(view=self)
         self.stop()
@@ -321,7 +318,6 @@ class AutoResponder(commands.Cog):
 
     @commands.group(name="autoresponder", aliases=["ar"], invoke_without_command=True)
     @commands.has_permissions(manage_messages=True)
-    @app_commands.default_permissions(manage_messages=True)
     async def autoresponder(self, ctx: commands.Context, trigger: str, *, response: str) -> None:
         """Add an autoresponder trigger
         
@@ -352,7 +348,6 @@ class AutoResponder(commands.Cog):
 
     @autoresponder.command(name="delete")
     @commands.has_permissions(manage_messages=True)
-    @app_commands.default_permissions(manage_messages=True)
     async def autoresponder_delete(self, ctx: commands.Context, *, trigger: str) -> None:
         """Delete an autoresponder trigger"""
         
@@ -383,7 +378,6 @@ class AutoResponder(commands.Cog):
 
     @autoresponder.command(name="list")
     @commands.has_permissions(manage_messages=True)
-    @app_commands.default_permissions(manage_messages=True)
     async def autoresponder_list(self, ctx: commands.Context) -> None:
         """List all autoresponders in this server"""
         
